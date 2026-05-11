@@ -25,3 +25,4 @@ for data in test_data:
         print(f"Inserted {data['status']} → {resp.status_code} {resp.json()}")
     except Exception as e:
         print(f"Error: {e}")
+        
