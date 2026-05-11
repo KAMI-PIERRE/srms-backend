@@ -5,16 +5,20 @@ from flask_cors import CORS
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables from .env file (local development)
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Allow React frontend to call this API
+CORS(app)  # Allow all origins (for React dashboard)
 
 # Supabase credentials
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY")  # Secret key for ESP32
+
+# Validate that credentials exist
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Missing SUPABASE_URL or SUPABASE_KEY in environment variables")
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -23,8 +27,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Helper: verify ESP32 API key
 # ----------------------------
 def verify_api_key():
-    auth = request.headers.get("X-API-Key")
-    return auth == API_KEY
+    auth_header = request.headers.get("X-API-Key")
+    return auth_header == API_KEY
 
 # ----------------------------
 # POST /api/breathing
@@ -32,19 +36,20 @@ def verify_api_key():
 # ----------------------------
 @app.route("/api/breathing", methods=["POST"])
 def receive_data():
-    # Check API key
     if not verify_api_key():
         return jsonify({"error": "Unauthorized"}), 401
 
-    data = request.json
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+
     patient_id = data.get("patient_id")
     rr = data.get("rr")
     status = data.get("status")
 
     if not all([patient_id, rr is not None, status]):
-        return jsonify({"error": "Missing fields: patient_id, rr, status"}), 400
+        return jsonify({"error": "Missing required fields: patient_id, rr, status"}), 400
 
-    # Insert into Supabase
     try:
         result = supabase.from_("breathing_records").insert({
             "patient_id": patient_id,
@@ -52,11 +57,11 @@ def receive_data():
             "status": status,
             "recorded_at": datetime.now().isoformat()
         }).execute()
-    except Exception as e:
-        print("Supabase error:", e)
-        return jsonify({"error": str(e)}), 500
 
-    return jsonify({"message": "OK", "id": result.data[0]["id"]}), 201
+        return jsonify({"message": "OK", "id": result.data[0]["id"]}), 201
+    except Exception as e:
+        app.logger.error(f"Supabase insert error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ----------------------------
 # GET /api/latest
@@ -72,8 +77,16 @@ def get_latest():
                          .execute()
         return jsonify(result.data)
     except Exception as e:
-        print("Supabase error:", e)
+        app.logger.error(f"Supabase fetch error: {e}")
         return jsonify({"error": str(e)}), 500
+
+# ----------------------------
+# GET /api/health (optional)
+# Simple health check for Render
+# ----------------------------
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
 
 # ----------------------------
 # Run the development server
