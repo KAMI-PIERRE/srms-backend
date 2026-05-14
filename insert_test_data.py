@@ -12,11 +12,11 @@ headers = {
 }
 
 test_data = [
-    {"patient_id": "PATIENT_001", "rr": 18, "status": "normal"},
-    {"patient_id": "PATIENT_001", "rr": 30, "status": "high"},
-    {"patient_id": "PATIENT_001", "rr": 7, "status": "low"},
+    {"patient_id": "PATIENT_001", "rr": 28, "status": "normal"},
+    {"patient_id": "PATIENT_001", "rr": 35, "status": "high"},
+    {"patient_id": "PATIENT_001", "rr": 70, "status": "low"},
     {"patient_id": "PATIENT_001", "rr": 22, "status": "borderline"},
-    {"patient_id": "PATIENT_001", "rr": 15, "status": "normal"},
+    {"patient_id": "PATIENT_001", "rr": 34, "status": "normal"},
 ]
 
 for data in test_data:
@@ -25,4 +25,3 @@ for data in test_data:
         print(f"Inserted {data['status']} → {resp.status_code} {resp.json()}")
     except Exception as e:
         print(f"Error: {e}")
-        
