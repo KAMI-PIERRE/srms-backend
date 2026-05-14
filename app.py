@@ -2,7 +2,10 @@ import os
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
+from flask_jwt_extended import (
+    JWTManager, jwt_required, create_access_token,
+    get_jwt_identity, verify_jwt_in_request
+)
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -11,8 +14,14 @@ from werkzeug.security import generate_password_hash, check_password_hash
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Allow all origins (for React dashboard)
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key')
+
+# CORS – restrict to your frontend origin in production via CORS_ORIGIN env var
+cors_origin = os.getenv("CORS_ORIGIN", "*")
+CORS(app, resources={r"/*": {"origins": cors_origin}})
+
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+if not app.config['JWT_SECRET_KEY']:
+    raise ValueError("JWT_SECRET_KEY must be set in environment variables")
 
 jwt = JWTManager(app)
 
@@ -21,62 +30,10 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 API_KEY = os.getenv("API_KEY")  # Secret key for ESP32
 
-# Validate that credentials exist
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing SUPABASE_URL or SUPABASE_KEY in environment variables")
 
-# Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ----------------------------
-# POST /register
-# Register a new user
-# ----------------------------
-@app.route("/register", methods=["POST"])
-def register():
-    data = request.get_json()
-    username = data.get("username")
-    password = data.get("password")
-    role = data.get("role")  # 'admin', 'caregiver', 'patient'
-
-    if not all([username, password, role]):
-        return jsonify({"error": "Missing fields"}), 400
-
-    password_hash = generate_password_hash(password)
-
-    try:
-        result = supabase.from_("users").insert({
-            "username": username,
-            "password_hash": password_hash,
-            "role": role
-        }).execute()
-        return jsonify({"message": "User registered"}), 201
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ----------------------------
-# POST /login
-# Login user
-# ----------------------------
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.get_json()
-    username = data.get("username")
-    password = data.get("password")
-
-    try:
-        result = supabase.from_("users").select("*").eq("username", username).execute()
-        if not result.data:
-            return jsonify({"error": "Invalid credentials"}), 401
-
-        user = result.data[0]
-        if not check_password_hash(user["password_hash"], password):
-            return jsonify({"error": "Invalid credentials"}), 401
-
-        access_token = create_access_token(identity={"username": username, "role": user["role"]})
-        return jsonify({"access_token": access_token, "role": user["role"]}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 # ----------------------------
 # Helper: verify ESP32 API key
@@ -84,6 +41,119 @@ def login():
 def verify_api_key():
     auth_header = request.headers.get("X-API-Key")
     return auth_header == API_KEY
+
+# ----------------------------
+# Helper: get current user identity from JWT
+# ----------------------------
+def current_user():
+    return get_jwt_identity()
+
+# ----------------------------
+# POST /register
+# Register a new user (caregiver or patient only)
+# ----------------------------
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+    role = data.get("role", "").strip()
+
+    if not all([username, password, role]):
+        return jsonify({"error": "Missing fields: username, password, role"}), 400
+
+    if role not in ("caregiver", "patient"):
+        return jsonify({"error": "Role must be 'caregiver' or 'patient'"}), 400
+
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+    password_hash = generate_password_hash(password)
+
+    try:
+        # Check if username already exists
+        existing = supabase.from_("users").select("id").eq("username", username).execute()
+        if existing.data:
+            return jsonify({"error": "Username already taken"}), 409
+
+        result = supabase.from_("users").insert({
+            "username": username,
+            "password_hash": password_hash,
+            "role": role
+        }).execute()
+
+        new_user_id = result.data[0]["id"]
+
+        # If registering as caregiver, also create a row in caregivers table
+        if role == "caregiver":
+            existing_cg = supabase.from_("caregivers").select("id").eq("caregiver_id", username).execute()
+            if not existing_cg.data:
+                supabase.from_("caregivers").insert({
+                    "caregiver_id": username,
+                    "name": username
+                }).execute()
+
+        # If registering as patient, also create a row in patients table
+        if role == "patient":
+            existing_pt = supabase.from_("patients").select("id").eq("patient_id", username).execute()
+            if not existing_pt.data:
+                supabase.from_("patients").insert({
+                    "patient_id": username,
+                    "name": username
+                }).execute()
+
+        return jsonify({"message": "User registered successfully"}), 201
+    except Exception as e:
+        app.logger.error(f"Register error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ----------------------------
+# POST /login
+# Login user, returns JWT + role
+# ----------------------------
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+
+    if not all([username, password]):
+        return jsonify({"error": "Missing username or password"}), 400
+
+    try:
+        result = supabase.from_("users").select("id, username, password_hash, role").eq("username", username).execute()
+        if not result.data:
+            return jsonify({"error": "Invalid credentials"}), 401
+
+        user = result.data[0]
+        if not check_password_hash(user["password_hash"], password):
+            return jsonify({"error": "Invalid credentials"}), 401
+
+        access_token = create_access_token(
+            identity={"id": user["id"], "username": username, "role": user["role"]}
+        )
+        return jsonify({
+            "access_token": access_token,
+            "role": user["role"],
+            "username": username
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Login error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ----------------------------
+# GET /api/health
+# Health check
+# ----------------------------
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
 
 # ----------------------------
 # POST /api/breathing
@@ -105,6 +175,9 @@ def receive_data():
     if not all([patient_id, rr is not None, status]):
         return jsonify({"error": "Missing required fields: patient_id, rr, status"}), 400
 
+    if status not in ("normal", "low", "high", "borderline"):
+        return jsonify({"error": "status must be one of: normal, low, high, borderline"}), 400
+
     try:
         result = supabase.from_("breathing_records").insert({
             "patient_id": patient_id,
@@ -120,10 +193,16 @@ def receive_data():
 
 # ----------------------------
 # GET /api/latest
-# Returns the 20 most recent records for the dashboard
+# Returns the 20 most recent breathing records (all patients)
+# Requires JWT (caregiver or admin)
 # ----------------------------
 @app.route("/api/latest", methods=["GET"])
+@jwt_required()
 def get_latest():
+    identity = current_user()
+    if identity.get("role") not in ("caregiver", "admin"):
+        return jsonify({"error": "Forbidden"}), 403
+
     try:
         result = supabase.from_("breathing_records") \
                          .select("*") \
@@ -136,21 +215,46 @@ def get_latest():
         return jsonify({"error": str(e)}), 500
 
 # ----------------------------
-# GET /api/health (optional)
-# Simple health check for Render
+# GET /api/breathing/patient/<patient_id>
+# Returns breathing records for a specific patient
+# Requires JWT (patient can only see own data; caregiver/admin can see any)
 # ----------------------------
-@app.route("/api/health", methods=["GET"])
-def health_check():
-    return jsonify({"status": "healthy"}), 200
+@app.route("/api/breathing/patient/<patient_id>", methods=["GET"])
+@jwt_required()
+def get_patient_breathing(patient_id):
+    identity = current_user()
+    role = identity.get("role")
+    username = identity.get("username")
+
+    # Patients can only access their own data
+    if role == "patient" and username != patient_id:
+        return jsonify({"error": "Forbidden"}), 403
+
+    try:
+        result = supabase.from_("breathing_records") \
+                         .select("*") \
+                         .eq("patient_id", patient_id) \
+                         .order("recorded_at", desc=True) \
+                         .limit(50) \
+                         .execute()
+        return jsonify(result.data)
+    except Exception as e:
+        app.logger.error(f"Supabase fetch error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ----------------------------
 # GET /api/patients
-# Get all patients
+# Get all patients (admin only)
 # ----------------------------
 @app.route("/api/patients", methods=["GET"])
-def get_patients():
+@jwt_required()
+def api_get_patients():
+    identity = current_user()
+    if identity.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
     try:
-        result = supabase.from_("patients").select("*").execute()
+        result = supabase.from_("patients").select("id, patient_id, name, age, condition, created_at").execute()
         return jsonify(result.data)
     except Exception as e:
         app.logger.error(f"Supabase fetch error: {e}")
@@ -158,105 +262,171 @@ def get_patients():
 
 # ----------------------------
 # POST /api/patients
-# Register a new patient
+# Register a new patient (admin only)
 # ----------------------------
 @app.route("/api/patients", methods=["POST"])
-def register_patient():
+@jwt_required()
+def api_register_patient():
+    identity = current_user()
+    if identity.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
     data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    patient_id = data.get("patient_id")
-    name = data.get("name")
+    patient_id = data.get("patient_id", "").strip()
+    name = data.get("name", "").strip()
+    age = data.get("age")
+    condition = data.get("condition", "")
 
     if not all([patient_id, name]):
         return jsonify({"error": "Missing required fields: patient_id, name"}), 400
 
     try:
-        result = supabase.from_("patients").insert({
-            "patient_id": patient_id,
-            "name": name
-        }).execute()
-        return jsonify({"message": "Patient registered", "id": result.data[0]["id"]}), 201
+        # Check duplicate
+        existing = supabase.from_("patients").select("id").eq("patient_id", patient_id).execute()
+        if existing.data:
+            return jsonify({"error": "Patient ID already exists"}), 409
+
+        insert_data = {"patient_id": patient_id, "name": name}
+        if age is not None:
+            insert_data["age"] = age
+        if condition:
+            insert_data["condition"] = condition
+
+        result = supabase.from_("patients").insert(insert_data).execute()
+
+        # Also create a user account for the patient with a default password
+        existing_user = supabase.from_("users").select("id").eq("username", patient_id).execute()
+        if not existing_user.data:
+            default_password = "Patient@123"
+            supabase.from_("users").insert({
+                "username": patient_id,
+                "password_hash": generate_password_hash(default_password),
+                "role": "patient"
+            }).execute()
+
+        return jsonify({
+            "message": "Patient registered successfully",
+            "id": result.data[0]["id"],
+            "default_password": "Patient@123"
+        }), 201
     except Exception as e:
         app.logger.error(f"Supabase insert error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ----------------------------
 # GET /api/caregivers
-# Get all caregivers
+# Get all caregivers (admin only)
 # ----------------------------
 @app.route("/api/caregivers", methods=["GET"])
-def get_caregivers():
+@jwt_required()
+def api_get_caregivers():
+    identity = current_user()
+    if identity.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
     try:
-        result = supabase.from_("caregivers").select("*").execute()
+        result = supabase.from_("caregivers").select("id, caregiver_id, name, specialization, created_at").execute()
         return jsonify(result.data)
     except Exception as e:
         app.logger.error(f"Supabase fetch error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ----------------------------
-# POST /api/caregivers
-# Register a new caregiver
-# ----------------------------
-@app.route("/api/caregivers", methods=["POST"])
-def register_caregiver():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Invalid JSON"}), 400
-
-    caregiver_id = data.get("caregiver_id")
-    name = data.get("name")
-
-    if not all([caregiver_id, name]):
-        return jsonify({"error": "Missing required fields: caregiver_id, name"}), 400
-
-    try:
-        result = supabase.from_("caregivers").insert({
-            "caregiver_id": caregiver_id,
-            "name": name
-        }).execute()
-        return jsonify({"message": "Caregiver registered", "id": result.data[0]["id"]}), 201
-    except Exception as e:
-        app.logger.error(f"Supabase insert error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ----------------------------
 # POST /api/assign
-# Assign caregiver to patient
+# Assign caregiver to patient (admin only)
 # ----------------------------
 @app.route("/api/assign", methods=["POST"])
-def assign_caregiver():
+@jwt_required()
+def api_assign_caregiver():
+    identity = current_user()
+    if identity.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
     data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    patient_id = data.get("patient_id")
-    caregiver_id = data.get("caregiver_id")
+    patient_id = data.get("patient_id", "").strip()
+    caregiver_id = data.get("caregiver_id", "").strip()
 
     if not all([patient_id, caregiver_id]):
         return jsonify({"error": "Missing required fields: patient_id, caregiver_id"}), 400
 
     try:
+        # Check if assignment already exists
+        existing = supabase.from_("assignments") \
+            .select("id") \
+            .eq("patient_id", patient_id) \
+            .eq("caregiver_id", caregiver_id) \
+            .eq("status", "active") \
+            .execute()
+        if existing.data:
+            return jsonify({"error": "This caregiver is already assigned to this patient"}), 409
+
         result = supabase.from_("assignments").insert({
             "patient_id": patient_id,
-            "caregiver_id": caregiver_id
+            "caregiver_id": caregiver_id,
+            "status": "active"
         }).execute()
-        return jsonify({"message": "Assignment created", "id": result.data[0]["id"]}), 201
+        return jsonify({"message": "Caregiver assigned successfully", "id": result.data[0]["id"]}), 201
     except Exception as e:
         app.logger.error(f"Supabase insert error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ----------------------------
+# GET /api/assignments
+# Get all assignments (admin only)
+# ----------------------------
+@app.route("/api/assignments", methods=["GET"])
+@jwt_required()
+def api_get_assignments():
+    identity = current_user()
+    if identity.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
+    try:
+        result = supabase.from_("assignments").select("*").order("assigned_at", desc=True).execute()
+        return jsonify(result.data)
+    except Exception as e:
+        app.logger.error(f"Supabase fetch error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ----------------------------
+# DELETE /api/assignments/<id>
+# Remove an assignment (admin only)
+# ----------------------------
+@app.route("/api/assignments/<int:assignment_id>", methods=["DELETE"])
+@jwt_required()
+def api_delete_assignment(assignment_id):
+    identity = current_user()
+    if identity.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
+    try:
+        supabase.from_("assignments").delete().eq("id", assignment_id).execute()
+        return jsonify({"message": "Assignment removed"}), 200
+    except Exception as e:
+        app.logger.error(f"Supabase delete error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ----------------------------
 # GET /api/stats
-# Get system statistics
+# Get system statistics (admin only)
 # ----------------------------
 @app.route("/api/stats", methods=["GET"])
-def get_stats():
+@jwt_required()
+def api_get_stats():
+    identity = current_user()
+    if identity.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
     try:
         patients_count = supabase.from_("patients").select("*", count="exact").execute().count
         caregivers_count = supabase.from_("caregivers").select("*", count="exact").execute().count
-        assignments_count = supabase.from_("assignments").select("*", count="exact").execute().count
+        assignments_count = supabase.from_("assignments").select("*", count="exact").eq("status", "active").execute().count
         readings_count = supabase.from_("breathing_records").select("*", count="exact").execute().count
         return jsonify({
             "patients": patients_count,
@@ -270,17 +440,33 @@ def get_stats():
 
 # ----------------------------
 # GET /api/logs
-# Get system logs (mock for now)
+# Get recent breathing records as system activity log (admin only)
 # ----------------------------
 @app.route("/api/logs", methods=["GET"])
-def get_logs():
-    # Mock logs - in real app, fetch from database or log files
-    logs = [
-        {"timestamp": "2026-05-14T10:00:00Z", "event": "Patient PATIENT_001 registered"},
-        {"timestamp": "2026-05-14T10:05:00Z", "event": "Caregiver assigned to PATIENT_001"},
-        {"timestamp": "2026-05-14T10:10:00Z", "event": "Breathing data received for PATIENT_001"},
-    ]
-    return jsonify(logs)
+@jwt_required()
+def api_get_logs():
+    identity = current_user()
+    if identity.get("role") != "admin":
+        return jsonify({"error": "Forbidden"}), 403
+
+    try:
+        result = supabase.from_("breathing_records") \
+            .select("id, patient_id, rr, status, recorded_at") \
+            .order("recorded_at", desc=True) \
+            .limit(50) \
+            .execute()
+
+        logs = [
+            {
+                "timestamp": record["recorded_at"],
+                "event": f"Patient {record['patient_id']} — RR: {record['rr']} bpm — Status: {record['status'].upper()}"
+            }
+            for record in result.data
+        ]
+        return jsonify(logs)
+    except Exception as e:
+        app.logger.error(f"Supabase fetch error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ----------------------------
 # Run the development server
